@@ -1,33 +1,45 @@
 
 /*
- * The intent is to develop a flexible keyboard / mouse / joystick emulator for the
- * ATTiny85, whose inputs are a from a bank of quadrature encoders. In this
- * example, the micro is connected to a pair of encoders, each having its own
- * pushbutton. This equates to 6 digital inputs; well beyond the capability of the
- * micro. As such, an I2C connected MCP23017 IO expander has been used.
+ * The intent is to develop a flexible keyboard / mouse / joystick emulator
+ * for the ATTiny85, whose inputs are a from a bank of quadrature encoders. In
+ * this example, the micro is connected to a pair of encoders, each having its
+ * own pushbutton. This equates to 6 digital inputs; well beyond the
+ * capability of the micro. As such, an I2C connected MCP23017 IO expander has
+ * been used.
  * 
- * 14 April 2023 v0.92
+ * 14 April 2023 v0.93
+ * Added the promised sensitivity control, and doubled the potential
+ * sensitivity.
+ * The inputs are defaulted to only 25% as sensitive as they could be, with
+ * the option to go to 50% or 100%.
+ * Both quad encoders now work and are output to the two bytes of the joystick
+ * buttons.
+ *
+ * 12 April 2023 v0.92
  * Added a change history.
- * Reworked to use a state machine. This means we don't wait for or inadvertently
- * ignore any I2C data. We only delay when absolutely idle.
- * implemented logic to decode the encoder and now have an internal byte which
- * increments or decrements depending on the direction the knob is turned. This
- * byte is output (guess where) on the joystick buttons.
- * The strategy is arguably too effective: the knob has 20 detention points as it
- * rotates, but each of those equates to 4 increments. I may implement a less
- * senstive (but more accurate) version.
+ * Reworked to use a state machine. This means we don't wait for or
+ * inadvertently ignore any I2C data. We only delay when absolutely idle.
+ * Implemented logic to decode the encoder and now have an internal byte which
+ * increments or decrements depending on the direction the knob is turned.
+ * This byte is output (guess where) on the joystick buttons. Even thought it
+ * could be made more sensitive, the strategy is arguably already too
+ * effective: the knob has 20 detention points as it rotates, but each of
+ * those equates to 2 increments (potentially 4). I will implement a less
+ * senstive version.
  *
  * 31 March 2023 v0.91
- * Now also grabs the PORTB interrupts and puts them out on the joystick buttons.
+ * Now also grabs the PORTB interrupts and puts them out on the joystick
+ * buttons.
  *
  * 24 March 2023 v0.9
- * Grabs PORTB from the GPIO expander and deposits it in the joystick input buttons,
- * as a handy debug output. Hardware is working fine.
+ * Grabs PORTB from the GPIO expander and deposits it in the joystick input
+ * buttons, as a handy debug output. Hardware is working fine.
  * 
  * Ken McMullan, 2023
  * 
- * ATtiny P5 (RESET) is not used, P4 and P3 are USB comms, P1 is the onboard LED.
- * P2 and P0 are SCL and SDA, connected to the I2C interface of the GPIO extender.
+ * ATtiny P5 (RESET) is not used, P4 and P3 are USB comms, P1 is the onboard
+ * LED. P2 and P0 are SCL and SDA, connected to the I2C interface of the GPIO
+ * extender.
  * 
  * 4.7Kohm pull-up resistors are used on the I2C bus.
  * 
@@ -77,13 +89,29 @@
 #define enc2B 0x20 // encoder 2 input B is bit 5
 #define enc2S 0x80 // encoder 2 button input is bit 7
 
+/* "sens" defines the sensitivity of the input. Bit 3 allows interrupts on
+ * rising input A, bit 2 allows interrupt on falling input A, bit 1 allows
+ * interrupt on rising input B and bit 0 allows interrupt on fallsing input B.
+ *   8 = reacts only to rising edges on input A (25% = 20 hits per revolution)
+ *  12 = reacts to rising and falling edges only on input A (50% = 40 hits)
+ *  15 = reacts to rising and falling edges on input A and input B (100%)
+ * Technically, 2, 4 and 8 are the same sensitivity as 1, for example, but the
+ * above are the only settings for most needs.
+ * Don't set it to zero: that would be silly.
+ */
+#define sens   0b1000 // we only care about bits 3..0
+//#define sens   0b1100 // we only care about bits 3..0
+//#define sens   0b1111 // we only care about bits 3..0
+
+#define sensAR 0b1000 // A rising interrupt allowed
+#define sensAF 0b0100 // A falling interrupt allowed
+#define sensBR 0b0010 // B rising interrupt allowed
+#define sensBF 0b0001 // B falling interrupt allowed
+
 #define pinLED 1
 
 char jBuf[8]; // char jBuf[8] = { x, y, xrot, yrot, zrot, slider, buttonLowByte, buttonHighByte };
 char eBuf[2]; // 16 bit I2C buffer
-
-//const long InterDelay = 0;   // delay between circles
-char tog = 0; // state of watchdog LED
 
 void setReg(unsigned int DevAddr, byte Reg, byte Val)
 {
@@ -92,7 +120,7 @@ void setReg(unsigned int DevAddr, byte Reg, byte Val)
   Wire.write(Reg);
   Wire.write(Val);
   Wire.endTransmission();
-}
+} // SetReg
 
 void ReqByteFrom(unsigned int DevAddr, byte Reg)
 {
@@ -100,7 +128,55 @@ void ReqByteFrom(unsigned int DevAddr, byte Reg)
   Wire.write(Reg);
   Wire.endTransmission();
   Wire.requestFrom(ExtAddr, 1);    // Request 1 byte of data
-}
+} // ReqByteFrom
+
+byte Decode(unsigned int INTF, unsigned int INTCAP, byte EncA, byte EncB, byte Sw)
+{
+  byte ret = 0; // return value
+  if (INTF & EncA) { // A changed
+    if (INTCAP & EncA) { // ...and is now high
+      if (sens & sensAR) { // ...and rising A interrupt is enabled
+        if (INTCAP & EncB) { // B is high
+          ret = 2; // clockwise
+        } else { // B is low
+          ret = 1; // counter-clockwise
+        }
+      } // rising A interrupt
+    } else { // A changed and is now low 
+      if (sens & sensAF) { // falling A interrupt is enabled
+        if (INTCAP & EncB) { // B is high
+          ret = 1; // counter-clockwise
+        } else { // B is low
+          ret = 2; // clockwise
+        }
+      } // falling A interrupt  
+    } // A changed to high 
+  } // A changed
+
+  else if (INTF & EncB) { // B changed
+    if (INTCAP & EncB) { // ...and is now high
+      if (sens & sensBR) { // ...and rising B interrupt is enabled
+        if (INTCAP & EncA) { // A is high
+          ret = 1; // counter-clockwise
+        } else { // A is low
+          ret = 2; // clockwise
+        }
+      } // rising B interrupt
+    } else { // B changed and is now low 
+      if (sens & sensBF) { // falling B interrupt is enabled
+        if (INTCAP & EncA) { // A is high
+          ret = 2; // clockwise
+        } else { // A is low
+          ret = 1; // counter-clockwise
+        }
+      } // falling B interrupt  
+    } // B changed to high 
+  } // B changed
+
+// else if switch buttton changed.... code goes here.... ret = 4
+
+  return ret;
+} // Decode
 
 void setup() {
 
@@ -116,9 +192,12 @@ void setup() {
 
 }
 
-int state = 0;
 byte cnt1 = 0;
-byte watchdog = 0;
+byte cnt2 = 0;
+char tog = 0;      // watchdog LED
+byte watchdog = 0; // watchdog counter
+int state = 0;     // execution state
+byte input = 0;    // input from controller
 
 void loop() {
 
@@ -147,27 +226,28 @@ void loop() {
         eBuf[1] = Wire.read(); 
         state = 3;
       }
-      break;        
+      break;
 
-    case 3: // decode the digital inputs
-      if (eBuf[0] & enc1A) { // A changed
-        if (eBuf[1] & enc1A) { // ...and is now high
-          if (eBuf[1] & enc1B) { // B is high
-            cnt1 -= 1;
-          } else { // B is low
-            cnt1 += 1;
-          }
-        } else { // A changed and is now low 
-          if (eBuf[1] & enc1B) { // B is high
-            cnt1 += 1;
-          } else { // B is low
-            cnt1 -= 1;
-          }
-        } // A changed to high 
-      } // A changed
+    case 3: // decode and act on the digital inputs
+      if (eBuf[0] & (enc1A | enc1B | enc1S)) { // encoder 1 (or button) changed
+        input = Decode(eBuf[0], eBuf[1], enc1A, enc1B, enc1S);        
+        if (input & 2) {
+          cnt1 += 1;
+        } else if (input & 1) {
+          cnt1 -= 1;
+        }
+      }
+      else if (eBuf[0] & (enc2A | enc2B | enc2S)) { // encoder 2 (or button) changed
+        input = Decode(eBuf[0], eBuf[1], enc2A, enc2B, enc2S);
+        if (input & 2) {
+          cnt2 += 1;
+        } else if (input & 1) {
+          cnt2 -= 1;
+        }
+      }
 
       jBuf[byteL] = cnt1; // move byte into joystick buffer
-      jBuf[byteH] = eBuf[1]; // move byte into joystick buffer
+      jBuf[byteH] = cnt2; // move byte into joystick buffer
       DigiJoystick.setValues(jBuf); // output the joystick buffer if it's been updated
 
       state = 4;
