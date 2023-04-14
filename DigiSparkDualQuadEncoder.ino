@@ -1,5 +1,44 @@
-// Ken McMullan, March 2023
 
+/*
+ * The intent is to develop a flexible keyboard / mouse / joystick emulator for the
+ * ATTiny85, whose inputs are a from a bank of quadrature encoders. In this
+ * example, the micro is connected to a pair of encoders, each having its own
+ * pushbutton. This equates to 6 digital inputs; well beyond the capability of the
+ * micro. As such, an I2C connected MCP23017 IO expander has been used.
+ * 
+ * 14 April 2023 v0.92
+ * Added a change history.
+ * Reworked to use a state machine. This means we don't wait for or inadvertently
+ * ignore any I2C data. We only delay when absolutely idle.
+ * implemented logic to decode the encoder and now have an internal byte which
+ * increments or decrements depending on the direction the knob is turned. This
+ * byte is output (guess where) on the joystick buttons.
+ * The strategy is arguably too effective: the knob has 20 detention points as it
+ * rotates, but each of those equates to 4 increments. I may implement a less
+ * senstive (but more accurate) version.
+ *
+ * 31 March 2023 v0.91
+ * Now also grabs the PORTB interrupts and puts them out on the joystick buttons.
+ *
+ * 24 March 2023 v0.9
+ * Grabs PORTB from the GPIO expander and deposits it in the joystick input buttons,
+ * as a handy debug output. Hardware is working fine.
+ * 
+ * Ken McMullan, 2023
+ * 
+ * ATtiny P5 (RESET) is not used, P4 and P3 are USB comms, P1 is the onboard LED.
+ * P2 and P0 are SCL and SDA, connected to the I2C interface of the GPIO extender.
+ * 
+ * 4.7Kohm pull-up resistors are used on the I2C bus.
+ * 
+ * Port B Port B of the GPIO externder is used as follows:
+ *  B0 encoder 1 button
+ *  B1 encoder 1 input B
+ *  B2 encoder 1 input A
+ *  B5 encoder 2 input B
+ *  B6 encoder 2 input A
+ *  B7 encoder 2 button
+ */
 #include <arduino.h>
 #include <Wire.h>
 #include "DigiJoystick.h" // output on joystick buttons for debug!
@@ -30,6 +69,13 @@
 #define regIOCON   0x0B
 
 #define maskPortB 0b11100111 // bits 4 and 3 are not input
+
+#define enc1A 0x04 // encoder 1 input A is bit 2
+#define enc1B 0x02 // encoder 1 input B is bit 1
+#define enc1S 0x01 // encoder 1 button input is bit 0
+#define enc2A 0x40 // encoder 2 input A is bit 6
+#define enc2B 0x20 // encoder 2 input B is bit 5
+#define enc2S 0x80 // encoder 2 button input is bit 7
 
 #define pinLED 1
 
@@ -70,33 +116,73 @@ void setup() {
 
 }
 
+int state = 0;
+byte cnt1 = 0;
+byte watchdog = 0;
+
 void loop() {
 
-  ReqByteFrom(ExtAddr, regINTFB);
-
-  if (Wire.available() == 1)    // Read requested bytes of data: the ADV value, MSbyte first
+  switch (state)
   {
-    eBuf[0] = Wire.read();
+    case 0: // request regINTFB
+      ReqByteFrom(ExtAddr, regINTFB);
+      state = 1;
+      break;
 
-    if (eBuf[0] != 0) {
-
-      ReqByteFrom(ExtAddr, regINTCAPB);
-
-      if (Wire.available() == 1)    // Read requested bytes of data: the ADV value, MSbyte first
+    case 1: // read regINTFB / request regINTCAPB
+      if (Wire.available() == 1) // is INFB available?
       {
-        eBuf[1] = Wire.read();
+        eBuf[0] = Wire.read(); // read INTFB
+        if (eBuf[0] == 0) {    // does it indicate an interrupt?
+          state = 4;           // no - go to pause
+        } else {               // yes - go to read INTCAP
+          ReqByteFrom(ExtAddr, regINTCAPB);
+          state = 2;          
+        }
+      }
+      break;
 
-        jBuf[byteL] = eBuf[0]; // move byte into joystick buffer
-        jBuf[byteH] = eBuf[1]; // move byte into joystick buffer
-        DigiJoystick.setValues(jBuf); // output the joystick buffer if it's been updated
+    case 2: // read INTCAPB
+      if (Wire.available() == 1) {
+        eBuf[1] = Wire.read(); 
+        state = 3;
+      }
+      break;        
 
-      } // INTCAPB available
-    } // INTFB <> 0
-  } // INTFB available
+    case 3: // decode the digital inputs
+      if (eBuf[0] & enc1A) { // A changed
+        if (eBuf[1] & enc1A) { // ...and is now high
+          if (eBuf[1] & enc1B) { // B is high
+            cnt1 -= 1;
+          } else { // B is low
+            cnt1 += 1;
+          }
+        } else { // A changed and is now low 
+          if (eBuf[1] & enc1B) { // B is high
+            cnt1 += 1;
+          } else { // B is low
+            cnt1 -= 1;
+          }
+        } // A changed to high 
+      } // A changed
 
-  if (tog == 0) {tog = 1;} else {tog  = 0;}
-  digitalWrite(pinLED, tog);
+      jBuf[byteL] = cnt1; // move byte into joystick buffer
+      jBuf[byteH] = eBuf[1]; // move byte into joystick buffer
+      DigiJoystick.setValues(jBuf); // output the joystick buffer if it's been updated
 
-  DigiJoystick.delay(500); // delay while keeping joystick active
+      state = 4;
 
-}
+      break;
+
+    case 4: // pause and toggle watchdog
+      DigiJoystick.delay(10); // delay while keeping joystick active
+      watchdog +=1;
+      if ((watchdog & 0x20) == 0x20) { // toggle LED every 32 cycles of 10ms
+        if (tog == 0) {tog = 1;} else {tog  = 0;}
+        digitalWrite(pinLED, tog);
+      }
+      state = 0;
+      break;
+
+  } // switch
+} // loop
